@@ -1,0 +1,217 @@
+import kagglehub
+import os
+import re
+import warnings
+warnings.filterwarnings("ignore")
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+from sklearn.multiclass import OneVsRestClassifier
+from sklearn.preprocessing import MultiLabelBinarizer
+from sklearn.pipeline import Pipeline
+from sklearn.metrics import (
+    classification_report, accuracy_score,
+    hamming_loss, f1_score
+)
+
+print(" Downloading dataset...")
+path = kagglehub.dataset_download("hijest/genre-classification-dataset-imdb")
+print(f" Dataset path: {path}")
+
+files = []
+for root, dirs, fnames in os.walk(path):
+    for f in fnames:
+        files.append(os.path.join(root, f))
+        print(f"   Found: {os.path.join(root, f)}")
+
+def load_imdb_genre_file(filepath):
+    records = []
+    with open(filepath, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(" ::: ")
+            if len(parts) == 4:
+                records.append({
+                    "id":    parts[0].strip(),
+                    "title": parts[1].strip(),
+                    "genre": parts[2].strip(),
+                    "plot":  parts[3].strip(),
+                })
+            elif len(parts) == 3:
+                records.append({
+                    "id":    parts[0].strip(),
+                    "title": parts[1].strip(),
+                    "genre": None,
+                    "plot":  parts[2].strip(),
+                })
+    return pd.DataFrame(records)
+
+train_df, test_df = None, None
+for fp in files:
+    fname = os.path.basename(fp).lower()
+    if "train" in fname:
+        train_df = load_imdb_genre_file(fp)
+        print(f"\n Train set loaded  → {train_df.shape}")
+    elif "test" in fname and "solution" not in fname:
+        test_df = load_imdb_genre_file(fp)
+        print(f" Test set loaded   → {test_df.shape}")
+
+if train_df is None:
+    raise FileNotFoundError("Could not find a training file. Check dataset structure above.")
+
+print("\n── EDA ─────────────────────────────────────────────────────")
+print(train_df.head(3).to_string())
+print(f"\nGenres (top 15):\n{train_df['genre'].value_counts().head(15)}")
+print(f"\nMissing values:\n{train_df.isnull().sum()}")
+
+plt.figure(figsize=(12, 5))
+top_genres = train_df["genre"].value_counts().head(15)
+sns.barplot(x=top_genres.values, y=top_genres.index, palette="viridis")
+plt.title("Top 15 Movie Genres in Training Set")
+plt.xlabel("Count")
+plt.tight_layout()
+plt.savefig("genre_distribution.png", dpi=150)
+plt.close()
+print(" Saved genre_distribution.png")
+
+def clean_text(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r"[^a-z\s]", " ", text)   # keep only letters
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+train_df["clean_plot"] = train_df["plot"].apply(clean_text)
+
+train_df.dropna(subset=["genre", "clean_plot"], inplace=True)
+train_df = train_df[train_df["clean_plot"].str.len() > 10]
+
+X = train_df["clean_plot"]
+y = train_df["genre"]
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+print(f"\nTrain size: {len(X_train)} | Val size: {len(X_val)}")
+
+tfidf_params = dict(
+    max_features=50_000,
+    ngram_range=(1, 2),
+    sublinear_tf=True,
+    min_df=2,
+    strip_accents="unicode",
+    analyzer="word",
+    token_pattern=r"\b[a-z]{2,}\b",
+)
+
+pipelines = {
+    "Naive Bayes (Multinomial)": Pipeline([
+        ("tfidf", TfidfVectorizer(**tfidf_params)),
+        ("clf",   MultinomialNB(alpha=0.1)),
+    ]),
+    "Logistic Regression": Pipeline([
+        ("tfidf", TfidfVectorizer(**tfidf_params)),
+        ("clf",   LogisticRegression(
+                      max_iter=1000, C=5, solver="lbfgs",
+                      multi_class="multinomial", n_jobs=-1
+                  )),
+    ]),
+    "Linear SVM": Pipeline([
+        ("tfidf", TfidfVectorizer(**tfidf_params)),
+        ("clf",   LinearSVC(C=0.5, max_iter=2000)),
+    ]),
+}
+
+print("\n── Model Training & Evaluation ──────────────────────────────────")
+results = {}
+
+for name, pipe in pipelines.items():
+    print(f"\n Training: {name}")
+    pipe.fit(X_train, y_train)
+    y_pred = pipe.predict(X_val)
+
+    acc = accuracy_score(y_val, y_pred)
+    f1  = f1_score(y_val, y_pred, average="weighted", zero_division=0)
+    results[name] = {"Accuracy": acc, "F1 (weighted)": f1}
+
+    print(f"   Accuracy      : {acc:.4f}")
+    print(f"   F1 (weighted) : {f1:.4f}")
+    print(classification_report(y_val, y_pred, zero_division=0))
+
+results_df = pd.DataFrame(results).T.sort_values("F1 (weighted)", ascending=False)
+print("\n── Results Summary ───────────────────────────────────────────────")
+print(results_df.to_string())
+
+best_model_name = results_df.index[0]
+best_pipeline   = pipelines[best_model_name]
+print(f"\n🏆 Best Model: {best_model_name}")
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+for ax, metric in zip(axes, ["Accuracy", "F1 (weighted)"]):
+    results_df[metric].plot(kind="barh", ax=ax, color=["#4CAF50","#2196F3","#FF5722"])
+    ax.set_title(metric)
+    ax.set_xlim(0, 1)
+    ax.axvline(0.5, ls="--", color="grey", lw=0.8)
+plt.suptitle("Model Comparison", fontsize=13, fontweight="bold")
+plt.tight_layout()
+plt.savefig("model_comparison.png", dpi=150)
+plt.close()
+print(" Saved model_comparison.png")
+
+if test_df is not None:
+    test_df["clean_plot"] = test_df["plot"].apply(clean_text)
+    test_preds = best_pipeline.predict(test_df["clean_plot"])
+    test_df["predicted_genre"] = test_preds
+
+    out_file = "test_predictions.csv"
+    test_df[["id", "title", "predicted_genre"]].to_csv(out_file, index=False)
+    print(f"\n Test predictions saved → {out_file}")
+    print(test_df[["title", "predicted_genre"]].head(10).to_string())
+
+def predict_genre(plot_summary: str, top_n: int = 3) -> None:
+
+    cleaned = clean_text(plot_summary)
+    pred    = best_pipeline.predict([cleaned])[0]
+
+    print(f"\n Input  : {plot_summary[:100]}...")
+    print(f"  Predicted Genre: {pred}")
+
+    # Probability / confidence scores
+    clf = best_pipeline.named_steps["clf"]
+    if hasattr(clf, "predict_proba"):
+        probs  = best_pipeline.predict_proba([cleaned])[0]
+        labels = best_pipeline.classes_
+    elif hasattr(clf, "decision_function"):
+        scores = best_pipeline.decision_function([cleaned])[0]
+        probs  = (scores - scores.min()) / (scores.max() - scores.min() + 1e-9)
+        labels = best_pipeline.classes_
+    else:
+        return
+
+    top_idx = np.argsort(probs)[::-1][:top_n]
+    print(f"   Top-{top_n} genres:")
+    for i in top_idx:
+        print(f"      {labels[i]:<20} {probs[i]*100:5.1f}%")
+
+print("\n── Demo Predictions ──────────────────────────────────────────────")
+demo_plots = [
+    ("Action", "A retired soldier must fight off a group of dangerous mercenaries "
+               "who have taken over a city, armed with nothing but his wits and a gun."),
+    ("Romance", "Two strangers meet on a train journey across Europe and fall deeply "
+                "in love, but their different lives threaten to tear them apart."),
+    ("Horror",  "A family moves into an old Victorian mansion and begins experiencing "
+                "terrifying supernatural events, haunted by its dark past."),
+    ("Comedy",  "A clumsy office worker accidentally becomes the mayor of New York "
+                "City and must pretend he knows what he is doing."),
+]
+
+for expected, plot in demo_plots:
+    predict_genre(plot)
+
+print("\n Pipeline complete!")
